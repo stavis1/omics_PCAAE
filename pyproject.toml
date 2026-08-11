@@ -1,9 +1,21 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "omics_PCAAE"
 version = "0.0.0"
-dependencies = []
+requires-python = ">=3.9"
+dependencies = [
+  "scikit-learn>=1.4.2",
+  "torch>=2",
+  "numpy",
+  "tqdm"
+]
 license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [{name = "Steven Tavis", email = "steven-lawrence.tavis@univ-lyon1.fr"}]
+
+[project.urls]
+Repository = "https://github.com/stavis1/omics_PCAAE.git"

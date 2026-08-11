@@ -78,13 +78,23 @@ class DecoderModel(nn.Module):
         return self.layers(x)
 
 class TrainingModel(nn.Module):
-    def __init__(self, vector_dim, frozen_encoders, dropout=0.1):
+    def __init__(self, vector_dim, 
+                 frozen_encoders, 
+                 encoder = None, 
+                 decoder = None, 
+                 dropout=0.1):
         super().__init__()
         self.frozen_encoders = nn.ModuleList(frozen_encoders)
-        self.encoder = EncoderModel(vector_dim, dropout)
-        self.decoder = DecoderModel(vector_dim, 
-                                    len(frozen_encoders)+1, 
-                                    dropout)
+        if encoder is not None:
+            self.encoder = encoder
+        else:
+            self.encoder = EncoderModel(vector_dim, dropout)
+        if decoder is not None:
+            self.decoder = decoder
+        else:
+            self.decoder = DecoderModel(vector_dim, 
+                                        len(frozen_encoders)+1, 
+                                        dropout)
     
     def forward(self, x):
         latent_space = []

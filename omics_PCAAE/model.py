@@ -97,17 +97,17 @@ class PCAAE(TransformerMixin, BaseEstimator):
         The per-parameter dropout probability during training.
     
     calculate_loadings : bool, default=False
-        calculates two matricies of shape (n_features, n_components):
-            monotonic_loadings_ : the Spearman r correlation between each feature
-            and each component
-        
-            nonmonotonic_loadings_ : The Pearson correlation coefficient between 
-            predicitons from a KNeighbors regression between each feature and 
-            each component
+        Whether to calculate the strength of both the monotonic and nonmonotonic
+        correlation between each input feature and each output component.
         As the neural network is a nonlinear transformation these values should 
         not be interpreted as identical to loadings in a PCA or factor analysis.
         However, they do provide similar information about the relationship
-        between a component and a feature. 
+        between a component and a feature. These values are stored in the attributes
+        `monotonic_loadings_` and `nonmonotonic_loadings_`
+        
+    warm_start : bool, default=False
+        If true re-fitting the model will initialize each iteration with the encoders
+        and decoders trained in the previous call to .fit()
     
     Attributes
     ----------
@@ -117,6 +117,17 @@ class PCAAE(TransformerMixin, BaseEstimator):
     feature_names_in_ : ndarray of shape (`n_features_in_`,)
         Names of features seen during :term:`fit`. Defined only when `X`
         has feature names that are all strings.
+    
+    loss_trace_ : dict of shape {str : [float]}
+        Each training epoch saves the loss from each minibatch in a list with the epoch
+        name as the dictionary key.
+    
+    monotonic_loadings_ : ndarray of shape (n_features, n_components)
+        the Spearman r correlation between each feature and each component
+
+    nonmonotonic_loadings_ : ndarray of shape (n_features, n_components)
+        The Pearson correlation coefficient between predicitons from a KNeighbors regression 
+        between each feature and each component
     """
     
     _parameter_constraints = {
@@ -137,7 +148,8 @@ class PCAAE(TransformerMixin, BaseEstimator):
                  batch_size = 10,
                  dropout = 0.1,
                  calculate_loadings = False,
-                 random_state = 0):
+                 random_state = 0,
+                 warm_start = False):
         self.device = device
         self.N_epochs = N_epochs
         self.N_components = N_components
@@ -146,9 +158,19 @@ class PCAAE(TransformerMixin, BaseEstimator):
         self.dropout = dropout
         self.calculate_loadings = calculate_loadings
         self.random_state = random_state
+        self.warm_start = warm_start
     
-    def _get_training_model(self, X):
-        model = TrainingModel(X[0].shape.numel(), self._encoders, self.dropout)
+    def _get_training_model(self, X, component):
+        if self.warm_start and self.training_round_ > 0:
+            model = TrainingModel(X[0].shape.numel(), 
+                                  self._encoders[:component],
+                                  self._encoders[component],
+                                  self._decoders[component],
+                                  self.dropout)
+        else:
+            model = TrainingModel(X[0].shape.numel(), 
+                                  self._encoders, 
+                                  dropout = self.dropout)
         model = model.to(self.device).to(torch.bfloat16)
         model.frozen_encoders.requires_grad_(False)
         return model
@@ -179,16 +201,26 @@ class PCAAE(TransformerMixin, BaseEstimator):
 
     def _train_model(self, X):
         g = self._set_random_state()
-        self._encoders = []
-        self.loss_trace_ = dict()
+        if not hasattr(self, 'training_round_'):
+            self.training_round_ = 0
+        else:
+            self.training_round_ += 1
+        if self.warm_start:
+            if not hasattr(self, '_encoders'):
+                self._encoders = []
+                self._decoders = []
+        else:
+            self._encoders = []
+        if not hasattr(self, 'loss_trace_'):
+            self.loss_trace_ = dict()
         X = Dataset(X)
         dataloader = torch.utils.data.DataLoader(X, 
                                                  batch_size=self.batch_size, 
                                                  shuffle=True,
                                                  worker_init_fn= self._seed_worker,
                                                  generator=g)
-        for component in range(1, self.N_components+1):
-            model = self._get_training_model(X)
+        for component in range(self.N_components):
+            model = self._get_training_model(X, component)
             optimizer = optim.AdamW(model.parameters(), lr=self.learning_rate)
             scheduler = optim.lr_scheduler.LinearLR(optimizer, 
                                                     start_factor=0.01, 
@@ -197,8 +229,10 @@ class PCAAE(TransformerMixin, BaseEstimator):
             
             #train model
             for epoch in range(self.N_epochs):
-                epoch_title = f'Component {component}/{self.N_components}, '
+                epoch_title = f'Component {component+1}/{self.N_components}, '
                 epoch_title += f'Epoch {epoch+1}/{self.N_epochs}'
+                if self.warm_start:
+                    epoch_title += f', Training round {self.training_round_+1}'
                 self.loss_trace_[epoch_title] = []
                 progress_bar = tqdm(dataloader, desc=epoch_title)
                 for x in progress_bar:
@@ -225,7 +259,15 @@ class PCAAE(TransformerMixin, BaseEstimator):
                 print(f"{epoch_title}; Avg loss: {avg_loss:.4f}")
             
             #save encoder
-            self._encoders.append(model.encoder)
+            if self.warm_start:
+                if self.training_round_ == 0:
+                    self._encoders.append(model.encoder)
+                    self._decoders.append(model.decoder)
+                else:
+                    self._encoders[component] = model.encoder
+                    self._decoders[component] = model.decoder
+            else:
+                self._encoders.append(model.encoder)
         self._decoder = model.decoder
     
     def _rank_transform(self, X):
@@ -309,7 +351,7 @@ class PCAAE(TransformerMixin, BaseEstimator):
     def get_feature_names_out(self, input_features = None):
         return np.array([f'component {i+1}' for i in range(self.N_components)])
     
-    def __sklearn_tags__(self):
-        tags = super().__sklearn_tags__()
-        tags.non_deterministic = True
-        return tags
+    # def __sklearn_tags__(self):
+    #     tags = super().__sklearn_tags__()
+    #     tags.non_deterministic = True
+    #     return tags

@@ -21,7 +21,7 @@ class Dataset(torch.utils.data.Dataset):
         self.X = torch.tensor(X, dtype = torch.bfloat16)
     
     def __len__(self):
-        return len(self.vectors)
+        return self.X.shape[0]
  
     def __getitem__(self, idx):
         return self.X[idx, :]

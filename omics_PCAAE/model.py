@@ -45,16 +45,20 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-import tqdm
+from tqdm import tqdm
 import torch
 import torch.optim as optim
 import numpy as np
-from sklearn.base import BaseEstimator, TransformerMixin, _fit_context, check_is_fitted
+from sklearn.base import BaseEstimator, TransformerMixin, _fit_context
+from sklearn.utils.validation import validate_data
 from sklearn.preprocessing import QuantileTransformer
 from sklearn.neighbors import KNeighborsRegressor
+from sklearn.exceptions import NotFittedError
 
 from omics_PCAAE.model_components import TrainingModel, TestingModel, InferenceModel, loss_func
 from omics_PCAAE.data_processing import Dataset
+
+torch.use_deterministic_algorithms(True)
 
 class PCAAE(TransformerMixin, BaseEstimator):
     """An implementation of the Principal Component Analsis AutoEncoder algorithm
@@ -132,7 +136,8 @@ class PCAAE(TransformerMixin, BaseEstimator):
                  learning_rate = 0.002,
                  batch_size = 10,
                  dropout = 0.1,
-                 calculate_loadings = False):
+                 calculate_loadings = False,
+                 random_state = 0):
         self.device = device
         self.N_epochs = N_epochs
         self.N_components = N_components
@@ -140,33 +145,48 @@ class PCAAE(TransformerMixin, BaseEstimator):
         self.batch_size = batch_size
         self.dropout = dropout
         self.calculate_loadings = calculate_loadings
-        self._is_fitted_ = False
+        self.random_state = random_state
     
     def _get_training_model(self, X):
-        model = TrainingModel(X.shape[1], self.encoders, self.dropout)
+        model = TrainingModel(X[0].shape.numel(), self._encoders, self.dropout)
         model = model.to(self.device).to(torch.bfloat16)
         model.frozen_encoders.requires_grad_(False)
         return model
     
     def _get_testing_model(self):
-        model = TestingModel(self.encoders, self.decoder)
+        model = TestingModel(self._encoders, self._decoder)
         model = model.to(self.device).to(torch.bfloat16)
         return model
     
     def _get_inference_model(self):
-        model = InferenceModel(self.encoders)
+        model = InferenceModel(self._encoders)
         model = model.to(self.device).to(torch.bfloat16)
         return model
     
+    def _seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+    
+    def _set_random_state(self):
+        if hasattr(self.random_state, 'seed'):
+            random_state = self.random_state.seed
+        else:
+            random_state = self.random_state
+        torch.manual_seed(random_state)
+        g = torch.Generator()
+        g.manual_seed(random_state)
+        return g
+
     def _train_model(self, X):
-        self.encoders = []
-        comps = range(len(self.N_components))
-        epochs = range(len(self.N_epochs))
-        self.loss_trace_ = {f'component {c+1}, epoch {e+1}':[] for c in comps for e in epochs}
+        g = self._set_random_state()
+        self._encoders = []
+        self.loss_trace_ = dict()
         X = Dataset(X)
         dataloader = torch.utils.data.DataLoader(X, 
                                                  batch_size=self.batch_size, 
-                                                 shuffle=True)
+                                                 shuffle=True,
+                                                 worker_init_fn= self._seed_worker,
+                                                 generator=g)
         for component in range(1, self.N_components+1):
             model = self._get_training_model(X)
             optimizer = optim.AdamW(model.parameters(), lr=self.learning_rate)
@@ -179,6 +199,7 @@ class PCAAE(TransformerMixin, BaseEstimator):
             for epoch in range(self.N_epochs):
                 epoch_title = f'Component {component}/{self.N_components}, '
                 epoch_title += f'Epoch {epoch+1}/{self.N_epochs}'
+                self.loss_trace_[epoch_title] = []
                 progress_bar = tqdm(dataloader, desc=epoch_title)
                 for x in progress_bar:
                     x = x.to(self.device)
@@ -197,15 +218,15 @@ class PCAAE(TransformerMixin, BaseEstimator):
                     loss.backward()
                     optimizer.step()
                     scheduler.step()
-                    self.loss_trace_[f'component {component+1}, epoch {epoch+1}'].append(loss.item())
+                    self.loss_trace_[epoch_title].append(loss.item())
                     
                     progress_bar.set_postfix(loss=loss.item())
-                avg_loss = np.mean(self.loss_trace[(component, epoch)])
+                avg_loss = np.mean(self.loss_trace_[epoch_title])
                 print(f"{epoch_title}; Avg loss: {avg_loss:.4f}")
             
             #save encoder
-            self.encoders.append(model.encoder)
-        self.decoder = model.decoder
+            self._encoders.append(model.encoder)
+        self._decoder = model.decoder
     
     def _rank_transform(self, X):
         qt = QuantileTransformer(n_quantiles = X.shape[0])
@@ -225,9 +246,9 @@ class PCAAE(TransformerMixin, BaseEstimator):
         lcol = range(ls.shape[1])
         self.monotonic_loadings_ = np.array([np.corrcoef(X[:,f], ls[:,c]) for f in xcol for c in lcol])
         self.nonmonotonic_loadings_ = np.array([self._kneighbors_r(X[:,f], ls[:,c]) for f in xcol for c in lcol])
-    
-    def __sklearn_is_fitted__(self):
-        return 
+
+    def _validate_data(self, *args, **kwargs):
+        return validate_data(self, *args, **kwargs)
     
     @_fit_context(prefer_skip_nested_validation=True)
     def fit(self, X, y=None):
@@ -251,40 +272,44 @@ class PCAAE(TransformerMixin, BaseEstimator):
         self._train_model(X)
         if self.calculate_loadings:
             self._get_factor_loadings(X)
-        self._is_fitted_ = True
-        # Return the transformer
         return self
         
+    def __sklearn_is_fitted__(self):
+        if not hasattr(self, '_encoders'):
+            raise NotFittedError()
+        else:
+            return True
+    
     def transform(self, X):
         """A reference implementation of a transform function.
 
         Parameters
         ----------
-        X : {array-like, sparse-matrix}, shape (n_samples, n_features)
+        X : {array-like}, shape (n_samples, n_features)
             The input samples.
 
         Returns
         -------
-        X_transformed : array, shape (n_samples, n_features)
-            The array containing the element-wise square roots of the values
-            in ``X``.
+        X_transformed : array, shape (n_samples, n_components)
+            The learned latent space of the autoencoder.
         """
-        check_is_fitted(self)
+        self.__sklearn_is_fitted__()
         X = self._validate_data(X, accept_sparse=False, reset=False)
         model = self._get_inference_model()
+        model.eval()
         X = Dataset(X)
         latent_space = []
-        for x in X:
-            x = x.unsqueeze(0).to(self.device).to(torch.bfloat16)
-            latent_space.append(model(x).view(-1).to(torch.long).numpy(force = True))
+        with torch.no_grad():
+            for x in X:
+                x = x.unsqueeze(0).to(self.device).to(torch.bfloat16)
+                latent_space.append(model(x).view(-1).to(torch.double).numpy(force = True))
         latent_space = np.array(latent_space)
         return latent_space
     
     def get_feature_names_out(self, input_features = None):
         return np.array([f'component {i+1}' for i in range(self.N_components)])
     
-    def _more_tags(self):
+    def __sklearn_tags__(self):
         tags = super().__sklearn_tags__()
         tags.non_deterministic = True
         return tags
-

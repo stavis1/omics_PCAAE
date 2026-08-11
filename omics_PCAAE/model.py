@@ -342,7 +342,8 @@ class PCAAE(TransformerMixin, BaseEstimator):
         X = Dataset(X)
         latent_space = []
         with torch.no_grad():
-            for x in X:
+            progress_bar = tqdm(X, desc = 'Inference')
+            for x in progress_bar:
                 x = x.unsqueeze(0).to(self.device).to(torch.bfloat16)
                 latent_space.append(model(x).view(-1).to(torch.double).numpy(force = True))
         latent_space = np.array(latent_space)

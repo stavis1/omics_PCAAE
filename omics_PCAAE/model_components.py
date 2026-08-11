@@ -14,6 +14,7 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
 some code included in this document (cov_loss) was released under the MIT license
+at https://github.com/chieupham/PCAAE
 this license is reproduced here:
 Copyright (c) 2020 Chi-Hiêu Pham, Saïd Ladjal, Alasdair Newson
 

@@ -15,34 +15,7 @@ GNU General Public License for more details.
 
 Some code in this document was released under the BSD 3-clause license
 at https://github.com/scikit-learn-contrib/project-template
-This is reproduced here:
-Copyright (c) 2016, Vighnesh Birodkar and scikit-learn-contrib contributors
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of project-template nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+This license can be found in thirdparty_licenses/scikit-learn-contrib_project-template
 """
 
 from tqdm import tqdm
@@ -172,17 +145,20 @@ class PCAAE(TransformerMixin, BaseEstimator):
                                   self._encoders, 
                                   dropout = self.dropout)
         model = model.to(self.device).to(torch.bfloat16)
+        model.train()
         model.frozen_encoders.requires_grad_(False)
         return model
     
     def _get_testing_model(self):
         model = TestingModel(self._encoders, self._decoder)
         model = model.to(self.device).to(torch.bfloat16)
+        model.eval()
         return model
     
     def _get_inference_model(self):
         model = InferenceModel(self._encoders)
         model = model.to(self.device).to(torch.bfloat16)
+        model.eval()
         return model
     
     def _seed_worker(worker_id):
@@ -227,7 +203,6 @@ class PCAAE(TransformerMixin, BaseEstimator):
                                                     end_factor=1.0, 
                                                     total_iters=len(X)*self.N_epochs)
             
-            #train model
             for epoch in range(self.N_epochs):
                 epoch_title = f'Component {component+1}/{self.N_components}, '
                 epoch_title += f'Epoch {epoch+1}/{self.N_epochs}'
@@ -237,26 +212,18 @@ class PCAAE(TransformerMixin, BaseEstimator):
                 progress_bar = tqdm(dataloader, desc=epoch_title)
                 for x in progress_bar:
                     x = x.to(self.device)
-    
-                    # Forward pass
                     optimizer.zero_grad()
                     ŷ, latent_space = model(x)
-                    
-                    # Compute loss
                     loss = loss_func(ŷ.view(-1), 
-                                   x.view(-1),
-                                   latent_space,
-                                   component)
-                    
-                    # Backward pass
+                                     x.view(-1),
+                                     latent_space,
+                                     component)
                     loss.backward()
                     optimizer.step()
                     scheduler.step()
                     self.loss_trace_[epoch_title].append(loss.item())
                     
                     progress_bar.set_postfix(loss=loss.item())
-                avg_loss = np.mean(self.loss_trace_[epoch_title])
-                print(f"{epoch_title}; Avg loss: {avg_loss:.4f}")
             
             #save encoder
             if self.warm_start:
@@ -322,8 +289,8 @@ class PCAAE(TransformerMixin, BaseEstimator):
         else:
             return True
     
-    def transform(self, X):
-        """A reference implementation of a transform function.
+    def transform(self, X, y = None):
+        """Embed observations in the learned latent space.
 
         Parameters
         ----------
@@ -338,7 +305,6 @@ class PCAAE(TransformerMixin, BaseEstimator):
         self.__sklearn_is_fitted__()
         X = self._validate_data(X, accept_sparse=False, reset=False)
         model = self._get_inference_model()
-        model.eval()
         X = Dataset(X)
         latent_space = []
         with torch.no_grad():
@@ -352,7 +318,37 @@ class PCAAE(TransformerMixin, BaseEstimator):
     def get_feature_names_out(self, input_features = None):
         return np.array([f'component {i+1}' for i in range(self.N_components)])
     
-    # def __sklearn_tags__(self):
-    #     tags = super().__sklearn_tags__()
-    #     tags.non_deterministic = True
-    #     return tags
+    def score(self, X, y = None):
+        """Score the reconstruction performance of the fitted model.
+
+        Parameters
+        ----------
+        X : {array-like}, shape (n_samples, n_features)
+            The input samples.
+
+        Returns
+        -------
+        score : float
+            The negative log loss of the full encoder-decoder model on the input samples.
+            The negative log is returned so that this works within the scikit-learn
+            ecosystem of model selection tools such as GridSearchCV. 
+            The covariance component of the loss function is not considered for testing.
+            This means that the train and test loss are not directly comparible. 
+        """
+        self.__sklearn_is_fitted__()
+        X = self._validate_data(X, accept_sparse=False, reset=False)
+        model = self._get_testing_model()
+        X = Dataset(X)
+        loss = []
+        with torch.no_grad():
+            progress_bar = tqdm(X, desc = 'Testing')
+            for x in progress_bar:
+                x = x.unsqueeze(0).to(self.device).to(torch.bfloat16)
+                x_hat = model(x)
+                loss.append(loss_func(x_hat, x))
+        return -np.log(np.mean(loss))
+
+
+
+
+

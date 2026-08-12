@@ -282,7 +282,12 @@ class PCAAE(TransformerMixin, BaseEstimator):
         if self.calculate_loadings:
             self._get_factor_loadings(X)
         return self
-        
+    
+    def partial_fit(self, X, y=None):
+        if not self.warm_start:
+            raise ValueError('warm_start must be True in order to use .partial_fit()')
+        self.fit(X)
+    
     def __sklearn_is_fitted__(self):
         if not hasattr(self, '_encoders'):
             raise NotFittedError()

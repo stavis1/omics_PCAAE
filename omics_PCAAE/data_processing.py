@@ -12,6 +12,10 @@ This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
+
+some code included in this document (PartialPipeline) was released under the Apache 2.0 license
+at https://github.com/koaning/tokenwiser
+This license can be found in thirdparty_licenses/tokenwiser
 """
 
 import torch
@@ -19,6 +23,7 @@ import numpy as np
 import pandas as pd
 from pyimzml.ImzMLParser import ImzMLParser
 from scipy.stats import binned_statistic
+from sklearn.pipeline import Pipeline
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, X):
@@ -71,3 +76,44 @@ def binned_imzML_reader(imzML_list,
     if drop_uniform_z and len(set(pixels['z'])) == 1:
         del pixels['z']
     return pixels
+
+class PartialPipeline(Pipeline):
+    """
+    Utility function to generate a `PartialPipeline`
+
+    Arguments:
+        steps: a collection of text-transformers
+
+    ```python
+    from tokenwiser.pipeline import PartialPipeline
+    from tokenwiser.textprep import HyphenTextPrep, Cleaner
+
+    tc = PartialPipeline([('clean', Cleaner()), ('hyp', HyphenTextPrep())])
+    data = ["dinosaurhead", "another$$ sentence$$"]
+    results = tc.partial_fit(data).transform(data)
+    expected = ['di no saur head', 'an other  sen tence']
+
+    assert results == expected
+    ```
+    """
+    def partial_fit(self, X, y=None, classes=None, **kwargs):
+        """
+        Fits the components, but allow for batches.
+        """
+        for name, step in self.steps:
+            if not hasattr(step, "partial_fit"):
+                raise ValueError(
+                    f"Step {name} is a {step} which does not have `.partial_fit` implemented."
+                )
+        for name, step in self.steps:
+            if hasattr(step, "predict"):
+                step.partial_fit(X, y, classes=classes, **kwargs)
+            else:
+                step.partial_fit(X, y)
+            if hasattr(step, "transform"):
+                X = step.transform(X)
+        return self
+
+
+
+

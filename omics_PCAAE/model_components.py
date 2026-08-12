@@ -15,7 +15,7 @@ GNU General Public License for more details.
 
 some code included in this document (cov_loss) was released under the MIT license
 at https://github.com/chieupham/PCAAE
-This license can be found in thirdparty_licenses/PCAAE:
+This license can be found in thirdparty_licenses/PCAAE
 """
 
 import torch

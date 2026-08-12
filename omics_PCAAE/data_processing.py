@@ -96,20 +96,20 @@ class PartialPipeline(Pipeline):
     assert results == expected
     ```
     """
-    def partial_fit(self, X, y=None, classes=None, **kwargs):
+    def partial_fit(self, X, y=None, **kwargs):
         """
         Fits the components, but allow for batches.
         """
         for name, step in self.steps:
+            tags = step.__sklearn_tags__()
             if not hasattr(step, "partial_fit"):
-                raise ValueError(
-                    f"Step {name} is a {step} which does not have `.partial_fit` implemented."
-                )
+                if tags.requires_fit:
+                    raise ValueError(
+                        f"Step {name} is a {step} which does not have `.partial_fit` implemented."
+                    )
         for name, step in self.steps:
-            if hasattr(step, "predict"):
-                step.partial_fit(X, y, classes=classes, **kwargs)
-            else:
-                step.partial_fit(X, y)
+            if hasattr(step, "partial_fit"):
+                step.partial_fit(X, y, **kwargs)
             if hasattr(step, "transform"):
                 X = step.transform(X)
         return self

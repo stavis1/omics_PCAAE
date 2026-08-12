@@ -260,7 +260,7 @@ class PCAAE(TransformerMixin, BaseEstimator):
         return validate_data(self, *args, **kwargs)
     
     @_fit_context(prefer_skip_nested_validation=True)
-    def fit(self, X, y=None):
+    def fit(self, X, y=None, **kwargs):
         """A reference implementation of a fitting function for a transformer.
 
         Parameters
@@ -283,7 +283,7 @@ class PCAAE(TransformerMixin, BaseEstimator):
             self._get_factor_loadings(X)
         return self
     
-    def partial_fit(self, X, y=None):
+    def partial_fit(self, X, y=None, **kwargs):
         if not self.warm_start:
             raise ValueError('warm_start must be True in order to use .partial_fit()')
         self.fit(X)
@@ -294,7 +294,7 @@ class PCAAE(TransformerMixin, BaseEstimator):
         else:
             return True
     
-    def transform(self, X, y = None):
+    def transform(self, X, y = None, **kwargs):
         """Embed observations in the learned latent space.
 
         Parameters
@@ -323,7 +323,7 @@ class PCAAE(TransformerMixin, BaseEstimator):
     def get_feature_names_out(self, input_features = None):
         return np.array([f'component {i+1}' for i in range(self.N_components)])
     
-    def score(self, X, y = None):
+    def score(self, X, y = None, **kwargs):
         """Score the reconstruction performance of the fitted model.
 
         Parameters

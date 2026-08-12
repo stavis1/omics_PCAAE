@@ -18,6 +18,7 @@ at https://github.com/koaning/tokenwiser
 This license can be found in thirdparty_licenses/tokenwiser
 """
 
+import zlib
 import torch
 import numpy as np
 import pandas as pd
@@ -35,34 +36,44 @@ class Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.X[idx, :]
 
-def binned_imzML_reader(imzML_list, 
+def binned_imzML_reader(imzML, 
                         mz_min, 
                         mz_max,
-                        ibd_list = None,
+                        ibd = None,
                         bin_width = 0.05,
                         filter_empty_bins = False,
                         drop_uniform_z = True):
-    if ibd_list is not None:
-        ibds = {m:i for m,i in zip(imzML_list, ibd_list)}
     metadata = []
     vectors = []
-    for imzML in imzML_list:
-        if ibd_list is None:
-            data = ImzMLParser(imzML)
-        else:
-            data = ImzMLParser(imzML, ibd_file = ibds[imzML])
-        for idx, (x,y,z) in enumerate(data.coordinates):
-            mz, intensity = data.getspectrum(idx)
-            vector = binned_statistic(mz,
-                                      intensity, 
-                                      statistic = 'sum',
-                                      bins = int((mz_max - mz_min)/bin_width),
-                                      range = (mz_min, mz_max))
-            metadata.append(pd.Series({'x':x,
-                                       'y':y,
-                                       'z':z,
-                                       'file':imzML}))
-            vectors.append(vector.statistic)
+    if ibd is None:
+        data = ImzMLParser(imzML)
+    else:
+        data = ImzMLParser(imzML, ibd_file = ibd)
+    #pyimzml does not natively handle zlib compressed data
+    #so we have to detect and decompress manually
+    params = data.metadata.pretty()['referenceable_param_groups']
+    zlib_i = params['intensityArray']['zlib compression']
+    zlib_m = params['mzArray']['zlib compression']
+    for idx, (x,y,z) in enumerate(data.coordinates):
+        mz_bytes, intensity_bytes = data.get_spectrum_as_string(idx)
+        if zlib_i:
+            intensity_bytes = zlib.decompress(intensity_bytes)
+        if zlib_m:
+            mz_bytes = zlib.decompress(mz_bytes)
+        intensity = np.frombuffer(intensity_bytes, 
+                                  dtype=data.intensityPrecision)
+        mz = np.frombuffer(mz_bytes, 
+                           dtype=data.mzPrecision)
+        vector = binned_statistic(mz,
+                                  intensity, 
+                                  statistic = 'sum',
+                                  bins = int((mz_max - mz_min)/bin_width),
+                                  range = (mz_min, mz_max))
+        metadata.append(pd.Series({'x':x,
+                                   'y':y,
+                                   'z':z,
+                                   'file':imzML}))
+        vectors.append(vector.statistic)
     pixels = pd.DataFrame(metadata)
     vectors = np.array(vectors)
     if filter_empty_bins:

@@ -29,7 +29,7 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.exceptions import NotFittedError
 
 from omics_PCAAE.model_components import TrainingModel, TestingModel, InferenceModel, loss_func
-from omics_PCAAE.data_processing import Dataset
+from omics_PCAAE.data_processing import TorchDataset
 
 torch.use_deterministic_algorithms(True)
 
@@ -189,7 +189,7 @@ class PCAAE(TransformerMixin, BaseEstimator):
             self._encoders = []
         if not hasattr(self, 'loss_trace_'):
             self.loss_trace_ = dict()
-        X = Dataset(X)
+        X = TorchDataset(X)
         dataloader = torch.utils.data.DataLoader(X, 
                                                  batch_size=self.batch_size, 
                                                  shuffle=True,
@@ -310,7 +310,7 @@ class PCAAE(TransformerMixin, BaseEstimator):
         self.__sklearn_is_fitted__()
         X = self._validate_data(X, accept_sparse=False, reset=False)
         model = self._get_inference_model()
-        X = Dataset(X)
+        X = TorchDataset(X)
         latent_space = []
         with torch.no_grad():
             progress_bar = tqdm(X, desc = 'Inference')
@@ -343,7 +343,7 @@ class PCAAE(TransformerMixin, BaseEstimator):
         self.__sklearn_is_fitted__()
         X = self._validate_data(X, accept_sparse=False, reset=False)
         model = self._get_testing_model()
-        X = Dataset(X)
+        X = TorchDataset(X)
         loss = []
         with torch.no_grad():
             progress_bar = tqdm(X, desc = 'Testing')

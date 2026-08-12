@@ -18,15 +18,19 @@ at https://github.com/koaning/tokenwiser
 This license can be found in thirdparty_licenses/tokenwiser
 """
 
+import os
 import zlib
+from collections import defaultdict
+
 import torch
+import h5py
 import numpy as np
 import pandas as pd
 from pyimzml.ImzMLParser import ImzMLParser
 from scipy.stats import binned_statistic
 from sklearn.pipeline import Pipeline
 
-class Dataset(torch.utils.data.Dataset):
+class TorchDataset(torch.utils.data.Dataset):
     def __init__(self, X):
         self.X = torch.tensor(X, dtype = torch.bfloat16)
     
@@ -125,6 +129,118 @@ class PartialPipeline(Pipeline):
                 X = step.transform(X)
         return self
 
+class DiskDataset:
+    def __init__(self, 
+                 path, 
+                 chunksize = 1000,
+                 shuffle = True,
+                 copy = False,
+                 seed = 0):
+        self.path = os.path.abspath(path)
+        self.columns = None
+        #its easier to store everything as a numpy ndarray so we need to convert
+        #string filenames to numeric indexes and store these for retrieval later
+        self._idx_file = dict()
+        self._file_idx = dict()
+        self._idx_rows = defaultdict(lambda:[])
+        self._N_rows = 0
+        self.copy = copy
+        self.rng = np.random.default_rng(seed)
+        self.chunksize = chunksize
+        self.shuffle = shuffle
+    
+    def _chunk_data(self):
+        chunkrange = range(0, self._N_rows, self.chunksize)
+        if self.shuffle:
+            idxs = self.rng.permuted(range(self._N_rows))
+            self.chunks = [idxs[i:i+self.chunksize] for i in chunkrange]
+        else:
+            self.chunks = [slice(i,i+self.chunksize) for i in chunkrange]
+    
+    def __iter__(self):
+        self._chunk_data()
+        return self
+    
+    def __next__(self):
+        if self.chunks:
+            return self[self.chunks.pop()]
+        else:
+            raise StopIteration
+    
+    def __len__(self):
+        return len(self.chunks)
 
+    def __getitem__(self, val):
+        if type(val) == slice:
+            idx = range(val.start if val.start is not None else 0, 
+                        val.stop if val.stop is not None else self._N_rows)
+        elif hasattr(val, '__iter__'):
+            val = sorted(val)
+            idx = val
+        else:
+            idx = [val]
+        with h5py.File(self.path, "r", driver=None) as f:
+            table = f.get('data')
+            data = table[val, :]
+            if len(idx) == 1:
+                data = data.T
+            data = pd.DataFrame(data, 
+                                index = idx,
+                                columns = self.columns)
+        data['file'] = [self._idx_file[int(i)] for i in data['file']]
+        return data
+    
+    def get_file(self, file):
+        idx = self._file_idx[file]
+        data = pd.concat([self[s] for s in self._idx_rows[idx]], 
+                         ignore_index = True)
+        return data
+    
+    def list_files(self):
+        return list(self._file_idx.keys())
+    
+    def _add_file_ranges(self, data):
+        #in order to more efficiently retrieve data for specific files
+        #we save the data by file in chunks and keep track of the index
+        #slices we need to get a file from the combined table
+        data['index'] = range(data.shape[0])
+        ranges = (data[['file','index']]
+                  .groupby('file')['index']
+                  .apply(lambda x: slice(min(x)+self._N_rows, 
+                                         max(x)+self._N_rows+1))
+                  .to_dict()
+                  )
+        for k,v in ranges.items():
+            self._idx_rows[k].append(v)
+        del data['index']
+    
+    def add_data(self, data):
+        if self.copy:
+            data = data.copy()
+        if self.columns is None:
+            self.columns = data.columns
+        new_files = list(set(data['file']).difference(self._file_idx.keys()))
+        max_idx = max(self._file_idx.values()) if self._file_idx else 0
+        new_idxs = [i+max_idx for i in range(len(new_files))]
+        self._file_idx.update({f:i for f,i in zip(new_files, new_idxs)})
+        self._idx_file = {v:k for k,v in self._file_idx.items()}
+        data['file'] = [self._file_idx[f] for f in data['file']]
+        data = data.sort_values('file')
+        self._add_file_ranges(data)
+        
+        data = data[self.columns].to_numpy()
+        self._N_rows += data.shape[0]
+        
+        with h5py.File(self.path, "a", driver=None) as f:
+            table = f.get('data')
+            if table is None:
+                table = f.create_dataset("data",
+                                         data = data,
+                                         maxshape=(None, data.shape[1]))
+            else:
+                shape = table.shape
+                table.resize((data.shape[0]+shape[0],shape[1]))
+                table[-data.shape[0]:,:] = data
+        self._chunk_data()
 
 

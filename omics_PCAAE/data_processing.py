@@ -137,13 +137,6 @@ class DiskDataset:
                  copy = False,
                  seed = 0):
         self.path = os.path.abspath(path)
-        self.columns = None
-        #its easier to store everything as a numpy ndarray so we need to convert
-        #string filenames to numeric indexes and store these for retrieval later
-        self._idx_file = dict()
-        self._file_idx = dict()
-        self._idx_rows = defaultdict(lambda:[])
-        self._N_rows = 0
         self.copy = copy
         self.rng = np.random.default_rng(seed)
         self.chunksize = chunksize
@@ -168,22 +161,27 @@ class DiskDataset:
             raise StopIteration
     
     def __len__(self):
+        self.chunk_data()
         return len(self.chunks)
 
+    def _positive(self, val):
+        return val if val >= 0 else self._N_rows + val
+
     def __getitem__(self, val):
+        self._load_metadata()
         if type(val) == slice:
-            idx = range(val.start if val.start is not None else 0, 
-                        val.stop if val.stop is not None else self._N_rows)
+            start = val.start if val.start is not None else 0
+            stop = val.stop if val.stop is not None else self._N_rows
+            idx = range(self._positive(start), self._positive(stop))
         elif hasattr(val, '__iter__'):
-            val = sorted(val)
+            val = sorted({self._positive(v) for v in val})
             idx = val
         else:
-            idx = [val]
+            idx = [self._positive(val)]
+            val = [val]
         with h5py.File(self.path, "r", driver=None) as f:
-            table = f.get('data')
+            table = f['data']
             data = table[val, :]
-            if len(idx) == 1:
-                data = data.T
             data = pd.DataFrame(data, 
                                 index = idx,
                                 columns = self.columns)
@@ -213,34 +211,79 @@ class DiskDataset:
         for k,v in ranges.items():
             self._idx_rows[k].append(v)
         del data['index']
+        with h5py.File(self.path, "a", driver=None) as f:
+            idx_rows = f['idx_rows']
+            for idx, rows in self._idx_rows.items():
+                if str(idx) in set(f['idx_rows'].keys()):
+                    del idx_rows[str(idx)]
+                idx_rows[str(idx)] = [[s.start, s.stop] for s in rows]
+
     
-    def add_data(self, data):
-        if self.copy:
-            data = data.copy()
-        if self.columns is None:
-            self.columns = data.columns
+    def _load_metadata(self):
+        with h5py.File(self.path, "a", driver=None) as f:
+            if f.get('file_idx') is not None:
+                file_idx = f['file_idx']
+                files = list(file_idx.keys())
+                idxs = [i[()] for i in file_idx.values()]
+                self._idx_file = {i:f for i,f in zip(idxs, files)}
+                self._file_idx = {f:i for i,f in zip(idxs, files)}
+
+                idx_rows = f['idx_rows']
+                idxs = list(idx_rows.keys())
+                rows = [[slice(s[0],s[1]) for s in r] for r in idx_rows.values()]
+                self._idx_rows = {int(i):r for i,r in zip(idxs, rows)}
+                
+                data = f['data']
+                self._N_rows = data.shape[0]
+                
+                columns = f['columns']
+                self.columns = [c.decode() for c in columns[:]]
+
+            else:
+                self._idx_file = dict()
+                self._file_idx = dict()
+                self._idx_rows = defaultdict(lambda:[])
+                self._N_rows = 0
+                self.columns = None
+                f.create_group('file_idx')
+                f.create_group('idx_rows')
+
+    def _process_file_info(self, data):
         new_files = list(set(data['file']).difference(self._file_idx.keys()))
         max_idx = max(self._file_idx.values()) if self._file_idx else 0
         new_idxs = [i+max_idx for i in range(len(new_files))]
         self._file_idx.update({f:i for f,i in zip(new_files, new_idxs)})
-        self._idx_file = {v:k for k,v in self._file_idx.items()}
         data['file'] = [self._file_idx[f] for f in data['file']]
         data = data.sort_values('file')
+        with h5py.File(self.path, "a", driver=None) as f:
+            file_idx = f['file_idx']
+            for file in new_files:
+                file_idx[file] = self._file_idx[file]
+        return data
+
+    def add_data(self, data):
+        self._load_metadata()
+        if self.copy:
+            data = data.copy()
+        if self.columns is None:
+            self.columns = list(data.columns)
+        self._process_file_info(data)
         self._add_file_ranges(data)
         
         data = data[self.columns].to_numpy()
-        self._N_rows += data.shape[0]
         
         with h5py.File(self.path, "a", driver=None) as f:
             table = f.get('data')
             if table is None:
-                table = f.create_dataset("data",
-                                         data = data,
-                                         maxshape=(None, data.shape[1]))
+                f.create_dataset('data',
+                                 data = data,
+                                 maxshape=(None, data.shape[1]))
+                f.create_dataset('columns',
+                                 data = self.columns,
+                                 maxshape=len(self.columns))
             else:
                 shape = table.shape
                 table.resize((data.shape[0]+shape[0],shape[1]))
                 table[-data.shape[0]:,:] = data
         self._chunk_data()
-
 

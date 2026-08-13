@@ -29,6 +29,7 @@ import pandas as pd
 from pyimzml.ImzMLParser import ImzMLParser
 from scipy.stats import binned_statistic
 from sklearn.pipeline import Pipeline
+from sortedcontainers import SortedList
 
 class TorchDataset(torch.utils.data.Dataset):
     def __init__(self, X):
@@ -86,8 +87,63 @@ def binned_imzML_reader(imzML,
         mz_cols = vector.bin_edges[:-1][vector_mask]
     else:
         mz_cols = vector.bin_edges[:-1]
-    mz_cols = [f'mz_{mz}' for mz in mz_cols]        
-    pixels[mz_cols] = vectors
+    mz_cols += bin_width/2
+    mz_cols = [f'mz_{mz}' for mz in mz_cols]
+    vectors = pd.DataFrame(vectors, columns = mz_cols)
+    pixels = pd.concat([pixels, vectors], axis = 1)
+    if drop_uniform_z and len(set(pixels['z'])) == 1:
+        del pixels['z']
+    return pixels
+
+def targeted_imzML_reader(imzML, 
+                          targets,
+                          target_names = None,
+                          tol = 0.05,
+                          reduce = sum,
+                          ibd = None,
+                          drop_uniform_z = True):
+    metadata = []
+    vectors = []
+    if ibd is None:
+        data = ImzMLParser(imzML)
+    else:
+        data = ImzMLParser(imzML, ibd_file = ibd)
+    #pyimzml does not natively handle zlib compressed data
+    #so we have to detect and decompress manually
+    params = data.metadata.pretty()['referenceable_param_groups']
+    zlib_i = params['intensityArray']['zlib compression']
+    zlib_m = params['mzArray']['zlib compression']
+    for idx, (x,y,z) in enumerate(data.coordinates):
+        mz_bytes, intensity_bytes = data.get_spectrum_as_string(idx)
+        if zlib_i:
+            intensity_bytes = zlib.decompress(intensity_bytes)
+        if zlib_m:
+            mz_bytes = zlib.decompress(mz_bytes)
+        intensity = np.frombuffer(intensity_bytes, 
+                                  dtype=data.intensityPrecision)
+        mz = np.frombuffer(mz_bytes, 
+                           dtype=data.mzPrecision)
+        peaks = SortedList(zip(mz, intensity))
+
+        def quant_target(peaks, target, tol, reduce):
+            hits = peaks.irange((target - tol,),
+                                (target + tol,))
+            if hits:
+                return reduce([h[1] for h in hits])
+            else:
+                return 0
+
+        vector = np.array([quant_target(peaks, t, tol, reduce) for t in targets])
+        metadata.append(pd.Series({'x':x,
+                                   'y':y,
+                                   'z':z,
+                                   'file':imzML}))
+        vectors.append(vector)
+    pixels = pd.DataFrame(metadata)
+    if target_names is None:
+        target_names = [f'mz_{mz}' for mz in targets]
+    vectors = pd.DataFrame(np.array(vectors), columns = target_names)
+    pixels = pd.concat([pixels, vectors], axis = 1)
     if drop_uniform_z and len(set(pixels['z'])) == 1:
         del pixels['z']
     return pixels

@@ -28,13 +28,14 @@ class EncoderModel(nn.Module):
             nn.Linear(vector_dim, vector_dim),
             nn.SiLU(),
             nn.Dropout(p = dropout),            
-            nn.Linear(vector_dim, 2**6),
+            nn.Linear(vector_dim, 2**7),
             nn.SiLU(),
             nn.Dropout(p = dropout),            
-            nn.Linear(2**6, 2**5),
+            nn.Linear(2**7, 2**6),
             nn.SiLU(),
             nn.Dropout(p = dropout),            
-            nn.Linear(2**5, 1)
+            nn.Linear(2**6, 1),
+            nn.Sigmoid()
             )
  
     def forward(self, x):
@@ -44,13 +45,13 @@ class DecoderModel(nn.Module):
     def __init__(self, vector_dim, latent_dim, dropout=0.1):
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Linear(latent_dim, 2**5),
+            nn.Linear(latent_dim, 2**6),
             nn.SiLU(),
             nn.Dropout(p = dropout),            
-            nn.Linear(2**5, 2**6),
+            nn.Linear(2**6, 2**7),
             nn.SiLU(),
             nn.Dropout(p = dropout),            
-            nn.Linear(2**6, vector_dim),
+            nn.Linear(2**7, vector_dim),
             nn.SiLU(),
             nn.Dropout(p = dropout),            
             nn.Linear(vector_dim, vector_dim)
@@ -84,8 +85,8 @@ class TrainingModel(nn.Module):
             latent_space.append(encoder(x))
         latent_space.append(self.encoder(x))
         latent_space = torch.concat(latent_space, dim = 1)
-        ŷ = self.decoder(latent_space)
-        return (ŷ, latent_space)
+        y = self.decoder(latent_space)
+        return (y, latent_space)
 
 class TestingModel(nn.Module):
     def __init__(self, encoders, decoder):
@@ -123,12 +124,16 @@ def cov_loss(z,step):
         loss = torch.zeros_like(z)
     return loss.mean()
 
-mse_loss = nn.MSELoss()
-
-def loss_func(ŷ, y, latent_space = None, step = 0, λ = 0.5):
-    mse = λ*mse_loss(ŷ, y)
-    if latent_space is not None:
-        cov = (1-λ)*cov_loss(latent_space, step)
-    else:
-        cov = 0
-    return mse + cov
+class Loss:
+    def __init__(self, 
+                 ratio = 0.5):
+        self.ratio = ratio
+        self.mse_loss = nn.MSELoss()
+        
+    def __call__(self, y_hat, y, latent_space = None, step = 0):
+        mse = self.ratio*self.mse_loss(y_hat, y)
+        if latent_space is not None:
+            cov = (1-self.ratio)*cov_loss(latent_space, step)
+        else:
+            cov = 0
+        return mse + cov

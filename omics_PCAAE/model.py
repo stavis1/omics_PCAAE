@@ -27,8 +27,9 @@ from sklearn.utils.validation import validate_data
 from sklearn.preprocessing import QuantileTransformer
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.exceptions import NotFittedError
+from scipy.stats import spearmanr
 
-from omics_PCAAE.model_components import TrainingModel, TestingModel, InferenceModel, loss_func
+from omics_PCAAE.model_components import TrainingModel, TestingModel, InferenceModel, Loss
 from omics_PCAAE.data_processing import TorchDataset
 
 torch.use_deterministic_algorithms(True)
@@ -122,7 +123,8 @@ class PCAAE(TransformerMixin, BaseEstimator):
                  dropout = 0.1,
                  calculate_loadings = False,
                  random_state = 0,
-                 warm_start = False):
+                 warm_start = False,
+                 loss_ratio = 0.5):
         self.device = device
         self.N_epochs = N_epochs
         self.N_components = N_components
@@ -132,16 +134,17 @@ class PCAAE(TransformerMixin, BaseEstimator):
         self.calculate_loadings = calculate_loadings
         self.random_state = random_state
         self.warm_start = warm_start
+        self.loss_ratio = loss_ratio
     
-    def _get_training_model(self, X, component):
+    def _get_training_model(self, N_features, component):
         if self.warm_start and self.training_round_ > 0:
-            model = TrainingModel(X[0].shape.numel(), 
+            model = TrainingModel(N_features, 
                                   self._encoders[:component],
                                   self._encoders[component],
                                   self._decoders[component],
                                   self.dropout)
         else:
-            model = TrainingModel(X[0].shape.numel(), 
+            model = TrainingModel(N_features, 
                                   self._encoders, 
                                   dropout = self.dropout)
         model = model.to(self.device).to(torch.bfloat16)
@@ -174,7 +177,18 @@ class PCAAE(TransformerMixin, BaseEstimator):
         g = torch.Generator()
         g.manual_seed(random_state)
         return g
-
+    
+    def _get_dataloader(self, X, g):
+        if type(X) != np.ndarray:
+            X = np.array(X)
+        X = TorchDataset(X)
+        dataloader = torch.utils.data.DataLoader(X, 
+                                                 batch_size=self.batch_size, 
+                                                 shuffle=True,
+                                                 worker_init_fn= self._seed_worker,
+                                                 generator=g)
+        return dataloader
+    
     def _train_model(self, X):
         g = self._set_random_state()
         if not hasattr(self, 'training_round_'):
@@ -189,19 +203,16 @@ class PCAAE(TransformerMixin, BaseEstimator):
             self._encoders = []
         if not hasattr(self, 'loss_trace_'):
             self.loss_trace_ = dict()
-        X = TorchDataset(X)
-        dataloader = torch.utils.data.DataLoader(X, 
-                                                 batch_size=self.batch_size, 
-                                                 shuffle=True,
-                                                 worker_init_fn= self._seed_worker,
-                                                 generator=g)
+        N_samples, N_features = X.shape
+        dataloader = self._get_dataloader(X, g)
+        loss_func = Loss(self.loss_ratio)
         for component in range(self.N_components):
-            model = self._get_training_model(X, component)
+            model = self._get_training_model(N_features, component)
             optimizer = optim.AdamW(model.parameters(), lr=self.learning_rate)
             scheduler = optim.lr_scheduler.LinearLR(optimizer, 
                                                     start_factor=0.01, 
                                                     end_factor=1.0, 
-                                                    total_iters=len(X)*self.N_epochs)
+                                                    total_iters=N_samples*self.N_epochs)
             
             for epoch in range(self.N_epochs):
                 epoch_title = f'Component {component+1}/{self.N_components}, '
@@ -213,11 +224,11 @@ class PCAAE(TransformerMixin, BaseEstimator):
                 for x in progress_bar:
                     x = x.to(self.device)
                     optimizer.zero_grad()
-                    ŷ, latent_space = model(x)
-                    loss = loss_func(ŷ.view(-1), 
+                    y, latent_space = model(x)
+                    loss = loss_func(y.view(-1), 
                                      x.view(-1),
                                      latent_space,
-                                     component)
+                                     component+1)
                     loss.backward()
                     optimizer.step()
                     scheduler.step()
@@ -237,11 +248,6 @@ class PCAAE(TransformerMixin, BaseEstimator):
                 self._encoders.append(model.encoder)
         self._decoder = model.decoder
     
-    def _rank_transform(self, X):
-        qt = QuantileTransformer(n_quantiles = X.shape[0])
-        X = qt.fit_transform()
-        return X
-    
     def _kneighbors_r(self, X, y):
         X = X.reshape(-1,1)
         X = KNeighborsRegressor(n_neighbors = 50).fit(X, y).predict(X)
@@ -249,11 +255,9 @@ class PCAAE(TransformerMixin, BaseEstimator):
     
     def _get_factor_loadings(self, X):
         ls = self.transform(X)
-        ls = self._rank_transform(ls)
-        X = self._rank_transform(X)
         xcol = range(X.shape[1])
         lcol = range(ls.shape[1])
-        self.monotonic_loadings_ = np.array([np.corrcoef(X[:,f], ls[:,c]) for f in xcol for c in lcol])
+        self.monotonic_loadings_ = np.array([spearmanr(X[:,f], ls[:,c]) for f in xcol for c in lcol])
         self.nonmonotonic_loadings_ = np.array([self._kneighbors_r(X[:,f], ls[:,c]) for f in xcol for c in lcol])
 
     def _validate_data(self, *args, **kwargs):
@@ -343,14 +347,16 @@ class PCAAE(TransformerMixin, BaseEstimator):
         self.__sklearn_is_fitted__()
         X = self._validate_data(X, accept_sparse=False, reset=False)
         model = self._get_testing_model()
-        X = TorchDataset(X)
+        g = self._set_random_state()
+        dataloader = self._get_dataloader(X, g)
+        loss_func = Loss(self.loss_ratio)
         loss = []
         with torch.no_grad():
-            progress_bar = tqdm(X, desc = 'Testing')
+            progress_bar = tqdm(dataloader, desc = 'Testing')
             for x in progress_bar:
-                x = x.unsqueeze(0).to(self.device).to(torch.bfloat16)
+                x = x.to(self.device)
                 x_hat = model(x)
-                loss.append(loss_func(x_hat, x))
+                loss.append(loss_func(x_hat, x).item())
         return -np.log(np.mean(loss))
 
 

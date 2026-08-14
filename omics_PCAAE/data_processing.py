@@ -47,7 +47,9 @@ def binned_imzML_reader(imzML,
                         ibd = None,
                         bin_width = 0.05,
                         filter_empty_bins = False,
-                        drop_uniform_z = True):
+                        drop_uniform_z = True,
+                        zlib_intensity = False,
+                        zlib_mz = False):
     metadata = []
     vectors = []
     if ibd is None:
@@ -55,15 +57,12 @@ def binned_imzML_reader(imzML,
     else:
         data = ImzMLParser(imzML, ibd_file = ibd)
     #pyimzml does not natively handle zlib compressed data
-    #so we have to detect and decompress manually
-    params = data.metadata.pretty()['referenceable_param_groups']
-    zlib_i = params['intensityArray']['zlib compression']
-    zlib_m = params['mzArray']['zlib compression']
+    #so we have to decompress manually
     for idx, (x,y,z) in enumerate(data.coordinates):
         mz_bytes, intensity_bytes = data.get_spectrum_as_string(idx)
-        if zlib_i:
+        if zlib_intensity:
             intensity_bytes = zlib.decompress(intensity_bytes)
-        if zlib_m:
+        if zlib_mz:
             mz_bytes = zlib.decompress(mz_bytes)
         intensity = np.frombuffer(intensity_bytes, 
                                   dtype=data.intensityPrecision)
@@ -101,7 +100,9 @@ def targeted_imzML_reader(imzML,
                           tol = 0.05,
                           reduce = sum,
                           ibd = None,
-                          drop_uniform_z = True):
+                          drop_uniform_z = True,
+                          zlib_intensity = False,
+                          zlib_mz = False):
     metadata = []
     vectors = []
     if ibd is None:
@@ -109,15 +110,12 @@ def targeted_imzML_reader(imzML,
     else:
         data = ImzMLParser(imzML, ibd_file = ibd)
     #pyimzml does not natively handle zlib compressed data
-    #so we have to detect and decompress manually
-    params = data.metadata.pretty()['referenceable_param_groups']
-    zlib_i = params['intensityArray']['zlib compression']
-    zlib_m = params['mzArray']['zlib compression']
+    #so we have to decompress manually
     for idx, (x,y,z) in enumerate(data.coordinates):
         mz_bytes, intensity_bytes = data.get_spectrum_as_string(idx)
-        if zlib_i:
+        if zlib_intensity:
             intensity_bytes = zlib.decompress(intensity_bytes)
-        if zlib_m:
+        if zlib_mz:
             mz_bytes = zlib.decompress(mz_bytes)
         intensity = np.frombuffer(intensity_bytes, 
                                   dtype=data.intensityPrecision)

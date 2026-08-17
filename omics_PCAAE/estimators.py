@@ -29,8 +29,8 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.exceptions import NotFittedError
 from scipy.stats import spearmanr
 
-from omics_PCAAE.model_components import TrainingModel, TestingModel, InferenceModel, Loss
-from omics_PCAAE.data_processing import TorchDataset
+from omics_PCAAE._model_components import TrainingModel, TestingModel, InferenceModel, Loss
+from omics_PCAAE.processing import TorchDataset
 
 torch.use_deterministic_algorithms(True)
 

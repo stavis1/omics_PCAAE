@@ -24,7 +24,6 @@ import torch.optim as optim
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin, _fit_context
 from sklearn.utils.validation import validate_data
-from sklearn.preprocessing import QuantileTransformer
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.exceptions import NotFittedError
 from scipy.stats import spearmanr
@@ -34,7 +33,7 @@ from omics_PCAAE.processing import TorchDataset
 
 torch.use_deterministic_algorithms(True)
 
-class PCAAE(TransformerMixin, BaseEstimator):
+class PCAAE(BaseEstimator, TransformerMixin):
     """An implementation of the Principal Component Analsis AutoEncoder algorithm
     
     This iteratively fits PyTorch based autoencoders with a single dimensional latent space.

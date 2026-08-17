@@ -18,15 +18,26 @@ at https://github.com/scikit-learn-contrib/project-template
 This license can be found in thirdparty_licenses/scikit-learn-contrib_project-template
 """
 
+import warnings
+from copy import copy
+
 from tqdm import tqdm
 import torch
 import torch.optim as optim
 import numpy as np
-from sklearn.base import BaseEstimator, TransformerMixin, _fit_context
-from sklearn.utils.validation import validate_data
+from sortedcontainers import SortedList
+from sklearn.base import (BaseEstimator, 
+                          ClassifierMixin, 
+                          _fit_context, 
+                          MetaEstimatorMixin, 
+                          RegressorMixin,
+                          TransformerMixin,
+                          clone)
+from sklearn.utils import check_random_state
+from sklearn.utils.validation import validate_data, check_X_y
 from sklearn.neighbors import KNeighborsRegressor
-from sklearn.exceptions import NotFittedError
-from scipy.stats import spearmanr
+from sklearn.exceptions import NotFittedError, ConvergenceWarning
+from scipy.stats import spearmanr, pearsonr
 
 from omics_PCAAE._model_components import TrainingModel, TestingModel, InferenceModel, Loss
 from omics_PCAAE.processing import TorchDataset
@@ -99,7 +110,7 @@ class PCAAE(BaseEstimator, TransformerMixin):
         the Spearman r correlation between each feature and each component
 
     nonmonotonic_loadings_ : ndarray of shape (n_features, n_components)
-        The Pearson correlation coefficient between predicitons from a KNeighbors regression 
+        The Pearson correlation coefficient between predictions from a KNeighbors regression 
         between each feature and each component
     """
     
@@ -250,13 +261,13 @@ class PCAAE(BaseEstimator, TransformerMixin):
     def _kneighbors_r(self, X, y):
         X = X.reshape(-1,1)
         X = KNeighborsRegressor(n_neighbors = 50).fit(X, y).predict(X)
-        return np.corrcoef(X[:,0], y)
+        return pearsonr(X[:,0], y).statistic
     
     def _get_factor_loadings(self, X):
         ls = self.transform(X)
         xcol = range(X.shape[1])
         lcol = range(ls.shape[1])
-        self.monotonic_loadings_ = np.array([spearmanr(X[:,f], ls[:,c]) for f in xcol for c in lcol])
+        self.monotonic_loadings_ = np.array([spearmanr(X[:,f], ls[:,c]).statistic for f in xcol for c in lcol])
         self.nonmonotonic_loadings_ = np.array([self._kneighbors_r(X[:,f], ls[:,c]) for f in xcol for c in lcol])
 
     def _validate_data(self, *args, **kwargs):
@@ -358,7 +369,178 @@ class PCAAE(BaseEstimator, TransformerMixin):
                 loss.append(loss_func(x_hat, x).item())
         return -np.log(np.mean(loss))
 
+class SpyEM(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
+    """An implementation of the Spy-EM algorithm for positive-unlabeled learning
+    
+    
+    Parameters
+    ----------
+    esitmator : Scikit-Learn regressor
+        The underlying regression model to be fit at each iteration
+    
+    N_iter : int, default=5
+        The number of training iterations to complete. If N_iter=1 iterations can be controlled manually 
+        with the .iterate() method, this is useful for out-of-core learning with .partial_fit()
+    
+    FNR : float, default=0.05
+        The target false negative rate used for setting the prediction threshold.
+        If FNR=0 then no FNR control is performed and the threshold is set to 0.5.
+    
+    spy_frac : float, default=0
+        The fraction of labeled positive examples to treat as negative for setting the FNR threshold.
+        Should be between 0 and 1. If spy_frac=0 then no FNR control is performed and the threshold is set to 0.5. 
+        
+    calculate_loadings : bool, default=False
+        Whether to calculate the strength of both the monotonic and nonmonotonic
+        correlation between each input feature and the model score.
+        
+    random_state : int or RandomState instance, default=0
+        The seed of the pseudo random number generator that selects the spy subset. 
+        Pass an int for reproducible output across multiple function calls.
 
+    Attributes
+    ----------
+    estimator_ : Scikit-Learn regressor
+        The fitted regression model.
+    
+    threshold_ : float
+        The decision threshold used for FDR control.
+    
+    monotonic_loadings_ : ndarray of shape (n_features)
+        the Spearman r correlation between each feature and the positive probability
+
+    nonmonotonic_loadings_ : ndarray of shape (n_features)
+        The Pearson correlation coefficient between predictions from a 
+        KNeighbors regression and the positive probability
+    """
+    
+    _parameter_constraints = {
+        'estimator': [RegressorMixin],
+        'N_iter': [int],
+        'FNR' : [float, int],
+        'spy_frac' : [float, int],
+        'calculate_loadings' : [bool],
+        'random_state' : [int],
+    }
+
+    def __init__(self,
+                 estimator,
+                 N_iter=5,
+                 FNR=0.05,
+                 spy_frac=0,
+                 calculate_loadings=False,
+                 random_state=0):
+        self.estimator = estimator
+        self.N_iter = N_iter
+        self.FNR = FNR
+        self.spy_frac = spy_frac
+        self.calculate_loadings = calculate_loadings
+        self.random_state = random_state
+    
+    def __sklearn_is_fitted__(self):
+        if not hasattr(self, 'estimator_'):
+            raise NotFittedError()
+            
+    def _kneighbors_r(self, X, y):
+        X = X.reshape(-1,1)
+        X = KNeighborsRegressor(n_neighbors = 50).fit(X, y).predict(X)
+        return pearsonr(X, y).statistic
+    
+    def get_feature_loadings(self, X):
+        score = self.decision_function(X)
+        self.monotonic_loadings_ = np.array([spearmanr(X[:,f], score).statistic for f in range(X.shape[1])])
+        self.nonmonotonic_loadings_ = np.array([self._kneighbors_r(X[:,f], score) for f in range(X.shape[1])])
+    
+    @_fit_context(prefer_skip_nested_validation=True)
+    def fit(self, X, y, *args, **kwargs):
+        X, y = check_X_y(X, y, accept_sparse=False, force_writeable=True)
+        y = np.bool(y)
+        random_state = check_random_state(self.random_state)
+        
+        #set a subset of positive labels to zero for an independent estimate of the FDR threshold
+        spy = random_state.random_sample(y.shape) < self.spy_frac
+        spy = np.logical_and(spy, y)
+        _y = copy(y)
+        _y[spy] = 0
+        self._spy = spy
+        
+        #iteratively re-fit the estimator and update the labels
+        for i in range(self.N_iter):
+            self.estimator_ = clone(self.estimator)
+            self.estimator_.fit(X, _y, *args, **kwargs)
+            _y = self.decision_function(X)
+            _y[y] = 1
+        
+        #control the expected FNR using the spy subset
+        idx = np.logical_not(y)
+        idx = np.logical_or(idx, spy)
+        self.fit_fnr(X[idx, :], y[idx])
+        
+        #calculate relationships between features and predictions
+        if self.calculate_loadings:
+            self.get_feature_loadings(X)
+        return self
+    
+    def partial_fit(self, X, y, *args, **kwargs):
+        X, y = check_X_y(X, y, accept_sparse=False, force_writeable=True)
+        y = np.bool(y)
+        if not hasattr(self, 'estimator_') or self.estimator_ is None:
+            self.estimator_ = clone(self.estimator)
+        if hasattr(self, '_old_estimator'):
+            _y = self._old_estimator.predict(X)
+            _y = np.clip(_y, a_min = 0, a_max = 1)
+            _y[y] = 1            
+        else:
+            _y = y
+        self.estimator_.partial_fit(X, _y, *args, **kwargs)
+        return self
+    
+    @_fit_context(prefer_skip_nested_validation=True)
+    def fit_fnr(self, X, y, *args, **kwargs):
+        self.__sklearn_is_fitted__()
+        if self.FNR > 0:
+            X, y = check_X_y(X, y, accept_sparse=False, force_writeable=True)
+            scale = 1/self.spy_frac if self.spy_frac > 0 else 1
+            preds = self.decision_function(X)
+            P = SortedList(preds[np.bool(y)])
+            U = SortedList(preds[~np.bool(y)])
+            thresholds = sorted(preds, reverse = True)
+            for threshold in thresholds:
+                N_U = U.bisect_right(threshold)
+                N_P = P.bisect_right(threshold)*scale
+                FNR = N_P/N_U if N_U else 1
+                if FNR < self.FNR:
+                    self.threshold_ = threshold
+                    break
+            if not hasattr(self, 'threshold_'):
+                self.threshold_ = 0.5
+                message = 'No threshold found that controls the FNR at the desired level. This may be due to either poor classifier performance or too few spy samples. falling back on default threshold of 0.5'
+                warnings.warn(message, ConvergenceWarning)
+        else:
+            self.threshold_ = 0.5
+        return self
+        
+    def iterate(self):
+        if hasattr(self, 'estimator_'):
+            self._old_estimator = self.estimator_
+            self.estimator_ = None
+    
+    def decision_function(self, X, *args, **kwargs):
+        preds = self.estimator_.predict(X)
+        preds = np.clip(preds, a_min = 0, a_max = 1)
+        return preds
+
+    def predict_proba(self, X, *args, **kwargs):
+        self.__sklearn_is_fitted__()
+        X = validate_data(self, X)
+        preds = self.decision_function(X)
+        return np.array([preds, 1-preds]).T
+
+    def predict(self, X, *args, **kwargs):
+        self.__sklearn_is_fitted__()
+        X = validate_data(self, X)
+        preds = self.decision_function(X)
+        return np.int32(preds >= self.threshold_)
 
 
 

@@ -10,7 +10,8 @@ dependencies = [
   "scikit-learn>=1.4.2",
   "torch>=2",
   "numpy",
-  "tqdm"
+  "tqdm",
+  "sortedcontainers"
 ]
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]

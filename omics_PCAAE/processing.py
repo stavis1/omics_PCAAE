@@ -20,10 +20,11 @@ This license can be found in thirdparty_licenses/tokenwiser
 
 import os
 import zlib
+import tempfile
 from collections import defaultdict
 
 import torch
-import h5py
+import duckdb as dd
 import numpy as np
 import pandas as pd
 from pyimzml.ImzMLParser import ImzMLParser
@@ -32,14 +33,19 @@ from sklearn.pipeline import Pipeline
 from sortedcontainers import SortedList
 
 class TorchDataset(torch.utils.data.Dataset):
-    def __init__(self, X):
+    def __init__(self, X, y = None):
         self.X = torch.tensor(X, dtype = torch.bfloat16)
+        if y is not None:
+            self.y = torch.tensor(y, dtype = torch.bfloat16)
     
     def __len__(self):
         return self.X.shape[0]
  
     def __getitem__(self, idx):
-        return self.X[idx, :]
+        data = self.X[idx, :]
+        if hasattr(self, 'y'):
+            data = (data, self.y[idx])
+        return data
 
 def binned_imzML_reader(imzML, 
                         mz_min, 
@@ -183,161 +189,175 @@ class PartialPipeline(Pipeline):
                 X = step.transform(X)
         return self
 
-class DiskDataset:
+class SDDiterator:
+    def __init__(self, path, N_chunks, SDD):
+        self.path = path
+        self.chunks = list(range(N_chunks))
+        self.SDD = SDD
+    
+    def __iter__(self):
+        return self
+    
+    def __len__(self):
+        return len(self.chunks)
+    
+    def __next__(self):
+        if self.chunks:
+            return self.SDD[self.chunks.pop()]
+        else:
+            raise StopIteration
+
+class SparseDiskDataset:
     def __init__(self, 
                  path, 
                  chunksize = 1000,
                  shuffle = True,
                  copy = False,
-                 seed = 0):
+                 seed = 0,
+                 bin_width = 0.05,
+                 zlib_intensity = False,
+                 zlib_mz = False,
+                 mz_min = 100,
+                 mz_max = 2000,
+                 max_missing_frac = 0.5,
+                 min_intensity = 0):
+        if not path.endswith('.parquet'):
+            raise ValueError('path should end with .parquet')
         self.path = os.path.abspath(path)
         self.copy = copy
         self.rng = np.random.default_rng(seed)
         self.chunksize = chunksize
         self.shuffle = shuffle
-    
-    def _chunk_data(self):
-        chunkrange = range(0, self._N_rows, self.chunksize)
-        if self.shuffle:
-            idxs = self.rng.permuted(range(self._N_rows))
-            self.chunks = [idxs[i:i+self.chunksize] for i in chunkrange]
-        else:
-            self.chunks = [slice(i,i+self.chunksize) for i in chunkrange]
-    
-    def __iter__(self):
-        self._chunk_data()
-        return self
-    
-    def __next__(self):
-        if self.chunks:
-            return self[self.chunks.pop()]
-        else:
-            raise StopIteration
+        self.bin_width = bin_width
+        self.zlib_intensity = zlib_intensity
+        self.zlib_mz = zlib_mz
+        self.mz_min = mz_min
+        self.mz_max = mz_max
+        self.max_missing_frac = max_missing_frac
+        self.min_intensity = min_intensity
+        self.rng = np.random.default_rng(seed)
+        self.imzmls = []
+        self.ibds = dict()
+        self.N_chunks = 0
     
     def __len__(self):
-        self.chunk_data()
-        return len(self.chunks)
-
-    def _positive(self, val):
-        return val if val >= 0 else self._N_rows + val
-
-    def __getitem__(self, val):
-        self._load_metadata()
-        if type(val) == slice:
-            start = val.start if val.start is not None else 0
-            stop = val.stop if val.stop is not None else self._N_rows
-            idx = range(self._positive(start), self._positive(stop))
-        elif hasattr(val, '__iter__'):
-            val = sorted({self._positive(v) for v in val})
-            idx = val
+        return self.N_chunks
+    
+    def __iter__(self):
+        return SDDiterator(self.path, 
+                           self.N_chunks, 
+                           self)
+    
+    def __getitem__(self, idx):
+        return dd.query(f'''
+                        SELECT * EXCLUDE (chunk)
+                        FROM '{self.path}'
+                        WHERE chunk = {idx}
+                        ''').df()
+    
+    def _read_imzml_chunk(self,
+                    imzml, 
+                    idx_start,
+                    idx_stop,
+                    ibd = None):
+        metadata = []
+        vectors = []
+        if ibd is None:
+            data = ImzMLParser(imzml)
         else:
-            idx = [self._positive(val)]
-            val = [val]
-        with h5py.File(self.path, "r", driver=None) as f:
-            table = f['data']
-            data = table[val, :]
-            data = pd.DataFrame(data, 
-                                index = idx,
-                                columns = self.columns)
-        data['file'] = [self._idx_file[int(i)] for i in data['file']]
-        return data
+            data = ImzMLParser(imzml, ibd_file = ibd)
+        #pyimzml does not natively handle zlib compressed data
+        #so we have to decompress manually
+        for idx in range(idx_start, idx_stop):
+            x,y,z = data.coordinates[idx]
+            mz_bytes, intensity_bytes = data.get_spectrum_as_string(idx)
+            if self.zlib_intensity:
+                intensity_bytes = zlib.decompress(intensity_bytes)
+            if self.zlib_mz:
+                mz_bytes = zlib.decompress(mz_bytes)
+            intensity = np.frombuffer(intensity_bytes, 
+                                      dtype=data.intensityPrecision)
+            mz = np.frombuffer(mz_bytes, 
+                               dtype=data.mzPrecision)
+            vector = binned_statistic(mz,
+                                      intensity, 
+                                      statistic = 'sum',
+                                      bins = int((self.mz_max - self.mz_min)/self.bin_width),
+                                      range = (self.mz_min, self.mz_max))
+            metadata.append(pd.Series({'x':x,
+                                       'y':y,
+                                       'z':z,
+                                       'file':imzml}))
+            vectors.append(vector.statistic)
+        pixels = pd.DataFrame(metadata)
+        vectors = np.array(vectors)
+        vector_mask = np.any(vectors > self.min_intensity, axis = 0)
+        vectors = vectors[:,vector_mask]
+        vectors[~np.isfinite(vectors)] = 0
+        mz_cols = vector.bin_edges[:-1][vector_mask]
+        mz_cols += self.bin_width/2
+        mz_cols = [f'mz_{mz}' for mz in mz_cols]
+        vectors = pd.DataFrame(vectors, columns = mz_cols)
+        pixels = pd.concat([pixels, vectors], axis = 1)
+        if len(set(pixels['z'])) == 1:
+            del pixels['z']
+        return pixels
     
+    def read_data(self, imzml_list, ibd_list = []):
+        col_counts = defaultdict(lambda:0)
+        self.imzmls.extend(imzml_list)
+        ibds = defaultdict(lambda:None, {mz:bd for mz,bd in zip(imzml_list, ibd_list)})
+        self.ibds.update(ibd_list)
+        N_pixels = 0
+        parquets = []
+        
+        self.metadata = ['x', 'y', 'z', 'file']
+        with tempfile.TemporaryDirectory() as tempdir:
+            for imzml in imzml_list:
+                data = ImzMLParser(imzml)
+                n_spectra = len(data.coordinates)
+                breakpoints = list(range(0, n_spectra, self.chunksize))
+                breakpoints += [n_spectra]
+                for i in range(1, len(breakpoints)):
+                    pixels = self._read_imzml_chunk(imzml,
+                                                    breakpoints[i-1], 
+                                                    breakpoints[i],
+                                                    ibds[imzml])
+                    N_pixels += pixels.shape[0]
+                    quantcols = [c for c in pixels.columns if c not in self.metadata]
+                    counts = pixels[quantcols].apply(lambda x: np.sum(x > self.min_intensity)).to_dict()
+                    for col, count in counts.items():
+                        col_counts[col] += count
+                    path = os.path.join(tempdir, str(hash((imzml, i))) + '.parquet')
+                    pixels.to_parquet(path, engine='fastparquet', index = False)
+                    parquets.append(path)
+            if not 'z' in pixels.columns:
+                self.metadata.remove('z')
+            self.quantcols = [k for k,v in col_counts.items() if 1-(v/N_pixels) < self.max_missing_frac]
+            self.N_chunks = int(np.ceil(N_pixels/self.chunksize))
+            col_list = self.metadata + self.quantcols
+
+            for parquet in parquets:
+                data = pd.read_parquet(parquet, engine='pyarrow')
+                missing_cols = list(set(col_list).difference(data.columns))
+                missing = np.full((data.shape[0], len(missing_cols)), 0)
+                missing = pd.DataFrame(missing, 
+                                       index = data.index, 
+                                       columns = missing_cols)
+                data = pd.concat([data, missing])
+                data = data[col_list]
+                mask = np.any(data[self.quantcols] > self.min_intensity, axis = 1)
+                data = data[mask]
+                data['chunk'] = self.rng.choice(range(self.N_chunks), data.shape[0])
+                if os.path.exists(self.path):
+                    data.to_parquet(self.path, engine='fastparquet', append=True)
+                else:
+                    data.to_parquet(self.path, engine='fastparquet')
+
     def get_file(self, file):
-        idx = self._file_idx[file]
-        data = pd.concat([self[s] for s in self._idx_rows[idx]], 
-                         ignore_index = True)
-        return data
-    
-    def list_files(self):
-        return list(self._file_idx.keys())
-    
-    def _add_file_ranges(self, data):
-        #in order to more efficiently retrieve data for specific files
-        #we save the data by file in chunks and keep track of the index
-        #slices we need to get a file from the combined table
-        data['index'] = range(data.shape[0])
-        ranges = (data[['file','index']]
-                  .groupby('file')['index']
-                  .apply(lambda x: slice(min(x)+self._N_rows, 
-                                         max(x)+self._N_rows+1))
-                  .to_dict()
-                  )
-        for k,v in ranges.items():
-            self._idx_rows[k].append(v)
-        del data['index']
-        with h5py.File(self.path, "a", driver=None) as f:
-            idx_rows = f['idx_rows']
-            for idx, rows in self._idx_rows.items():
-                if str(idx) in set(f['idx_rows'].keys()):
-                    del idx_rows[str(idx)]
-                idx_rows[str(idx)] = [[s.start, s.stop] for s in rows]
-
-    
-    def _load_metadata(self):
-        with h5py.File(self.path, "a", driver=None) as f:
-            if f.get('file_idx') is not None:
-                file_idx = f['file_idx']
-                files = list(file_idx.keys())
-                idxs = [i[()] for i in file_idx.values()]
-                self._idx_file = {i:f for i,f in zip(idxs, files)}
-                self._file_idx = {f:i for i,f in zip(idxs, files)}
-
-                idx_rows = f['idx_rows']
-                idxs = list(idx_rows.keys())
-                rows = [[slice(s[0],s[1]) for s in r] for r in idx_rows.values()]
-                self._idx_rows = {int(i):r for i,r in zip(idxs, rows)}
-                
-                data = f['data']
-                self._N_rows = data.shape[0]
-                
-                columns = f['columns']
-                self.columns = [c.decode() for c in columns[:]]
-
-            else:
-                self._idx_file = dict()
-                self._file_idx = dict()
-                self._idx_rows = defaultdict(lambda:[])
-                self._N_rows = 0
-                self.columns = None
-                f.create_group('file_idx')
-                f.create_group('idx_rows')
-
-    def _process_file_info(self, data):
-        new_files = list(set(data['file']).difference(self._file_idx.keys()))
-        max_idx = max(self._file_idx.values()) if self._file_idx else 0
-        new_idxs = [i+max_idx for i in range(len(new_files))]
-        self._file_idx.update({f:i for f,i in zip(new_files, new_idxs)})
-        data['file'] = [self._file_idx[f] for f in data['file']]
-        data = data.sort_values('file')
-        with h5py.File(self.path, "a", driver=None) as f:
-            file_idx = f['file_idx']
-            for file in new_files:
-                file_idx[file] = self._file_idx[file]
-        return data
-
-    def add_data(self, data):
-        self._load_metadata()
-        if self.copy:
-            data = data.copy()
-        if self.columns is None:
-            self.columns = list(data.columns)
-        self._process_file_info(data)
-        self._add_file_ranges(data)
-        
-        data = data[self.columns].to_numpy()
-        
-        with h5py.File(self.path, "a", driver=None) as f:
-            table = f.get('data')
-            if table is None:
-                f.create_dataset('data',
-                                 data = data,
-                                 maxshape=(None, data.shape[1]))
-                f.create_dataset('columns',
-                                 data = self.columns,
-                                 maxshape=len(self.columns))
-            else:
-                shape = table.shape
-                table.resize((data.shape[0]+shape[0],shape[1]))
-                table[-data.shape[0]:,:] = data
-        self._chunk_data()
+        return dd.query(f'''
+                        SELECT * EXCLUDE (chunk)
+                        FROM '{self.path}'
+                        WHERE file = '{file}'
+                        ''').df()
 

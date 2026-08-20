@@ -438,8 +438,7 @@ class SpyEM(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         self.random_state = random_state
     
     def __sklearn_is_fitted__(self):
-        if not hasattr(self, 'estimator_'):
-            raise NotFittedError()
+        return hasattr(self, 'estimator_')
             
     def _kneighbors_r(self, X, y):
         X = X.reshape(-1,1)
@@ -468,8 +467,9 @@ class SpyEM(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         for i in range(self.N_iter):
             self.estimator_ = clone(self.estimator)
             self.estimator_.fit(X, _y, *args, **kwargs)
-            _y = self.decision_function(X)
-            _y[y] = 1
+            if i < self.N_iter - 1:
+                _y = self.decision_function(X)
+                _y[np.logical_and(y, ~spy)] = 1
         
         #control the expected FNR using the spy subset
         idx = np.logical_not(y)

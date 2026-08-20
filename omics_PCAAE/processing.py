@@ -358,7 +358,7 @@ class SparseDiskDataset:
                     results = p.starmap(_parallel_process_chunk, jobs)
             for result in results:
                 counts, pixel_count, path = result
-                for k,v in counts:
+                for k,v in counts.items():
                     col_counts[k] += v
                 N_pixels += pixel_count
                 parquets.append(path)

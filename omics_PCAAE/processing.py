@@ -207,7 +207,9 @@ class SDDiterator:
         else:
             raise StopIteration
 
-def _parallel_process_chunk(*args, state):
+def _parallel_process_chunk(*args):
+    state = args[1]
+    args = args[0]
     obj = SparseDiskDataset.__new__(SparseDiskDataset)
     obj.__dict__ = state
     results = obj._process_chunk(*args)
@@ -244,7 +246,7 @@ class SparseDiskDataset:
         self.min_intensity = min_intensity
         self.rng = np.random.default_rng(seed)
         self.imzmls = []
-        self.ibds = dict()
+        self.ibds = defaultdict(type(None))
         self.N_chunks = 0
         self.n_jobs = n_jobs
     
@@ -326,7 +328,9 @@ class SparseDiskDataset:
         quantcols = [c for c in pixels.columns if c not in self.metadata]
         col_counts = pixels[quantcols].apply(lambda x: np.sum(x > self.min_intensity)).to_dict()
         path = os.path.join(tempdir, str(hash((imzml, idx_start, idx_stop))) + '.parquet')
-        pixels.to_parquet(path, engine='fastparquet', index = False)
+        pixels.to_parquet(path,
+                          engine='fastparquet', 
+                          index = False)
         return (col_counts, N_pixels, path)
     
     def read_data(self, imzml_list, ibd_list = []):
@@ -378,9 +382,14 @@ class SparseDiskDataset:
                 data = data[mask]
                 data['chunk'] = self.rng.choice(range(self.N_chunks), data.shape[0])
                 if os.path.exists(self.path):
-                    data.to_parquet(self.path, engine='fastparquet', append=True)
+                    data.to_parquet(self.path, 
+                                    engine='fastparquet', 
+                                    append=True, 
+                                    index = False)
                 else:
-                    data.to_parquet(self.path, engine='fastparquet')
+                    data.to_parquet(self.path, 
+                                    engine='fastparquet',
+                                    index = False)
 
     def get_file(self, file):
         return dd.query(f'''
@@ -397,7 +406,7 @@ class SparseDiskDataset:
         self.metadata = ['x', 'y', 'z', 'file']
         if not 'z' in pixels.columns:
             self.metadata.remove('z')
-        self.quantcols = [c for c in pixels.columns if not c in self.metadata]
+        self.quantcols = [c for c in pixels.columns if c.startswith('mz_')]
         chunks = dd.query(f'''
                           SELECT DISTINCT chunk
                           FROM '{self.path}'

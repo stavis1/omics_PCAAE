@@ -11,7 +11,13 @@ dependencies = [
   "torch>=2",
   "numpy",
   "tqdm",
-  "sortedcontainers"
+  "sortedcontainers",
+  "duckdb",
+  "pandas",
+  "pyarrow",
+  "fastparquet",
+  "pyimzml",
+  "scipy"
 ]
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
@@ -20,3 +26,6 @@ authors = [{name = "Steven Tavis", email = "steven-lawrence.tavis@univ-lyon1.fr"
 
 [project.urls]
 Repository = "https://github.com/stavis1/omics_PCAAE.git"
+
+[tool.setuptools]
+py-modules = ['omics_PCAAE']

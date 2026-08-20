@@ -453,7 +453,7 @@ class SpyEM(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
     def get_feature_loadings(self, X):
         score = self.decision_function(X)
         self.monotonic_loadings_ = np.array([spearmanr(X[:,f], score).statistic for f in range(X.shape[1])])
-        self.nonmonotonic_loadings_ = np.array([self._kneighbors_r(X[:,f], score) for f in range(X.shape[1])])
+        # self.nonmonotonic_loadings_ = np.array([self._kneighbors_r(X[:,f], score) for f in range(X.shape[1])])
     
     @_fit_context(prefer_skip_nested_validation=True)
     def fit(self, X, y, *args, **kwargs):
@@ -502,7 +502,8 @@ class SpyEM(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
     
     @_fit_context(prefer_skip_nested_validation=True)
     def fit_fnr(self, X, y, *args, **kwargs):
-        self.__sklearn_is_fitted__()
+        if not self.__sklearn_is_fitted__():
+            raise NotFittedError()
         if self.FNR > 0:
             X, y = check_X_y(X, y, accept_sparse=False, force_writeable=True)
             scale = 1/self.spy_frac if self.spy_frac > 0 else 1
@@ -536,13 +537,15 @@ class SpyEM(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         return preds
 
     def predict_proba(self, X, *args, **kwargs):
-        self.__sklearn_is_fitted__()
+        if not self.__sklearn_is_fitted__():
+            raise NotFittedError()
         X = validate_data(self, X)
         preds = self.decision_function(X)
         return np.array([preds, 1-preds]).T
 
     def predict(self, X, *args, **kwargs):
-        self.__sklearn_is_fitted__()
+        if not self.__sklearn_is_fitted__():
+            raise NotFittedError()
         X = validate_data(self, X)
         preds = self.decision_function(X)
         return np.int32(preds >= self.threshold_)

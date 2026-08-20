@@ -276,15 +276,18 @@ class SparseDiskDataset:
         #so we have to decompress manually
         for idx in range(idx_start, idx_stop):
             x,y,z = data.coordinates[idx]
-            mz_bytes, intensity_bytes = data.get_spectrum_as_string(idx)
-            if self.zlib_intensity:
-                intensity_bytes = zlib.decompress(intensity_bytes)
-            if self.zlib_mz:
-                mz_bytes = zlib.decompress(mz_bytes)
-            intensity = np.frombuffer(intensity_bytes, 
-                                      dtype=data.intensityPrecision)
-            mz = np.frombuffer(mz_bytes, 
-                               dtype=data.mzPrecision)
+            if self.zlib_intensity or self.zlib_mz:
+                mz_bytes, intensity_bytes = data.get_spectrum_as_string(idx)
+                if self.zlib_intensity:
+                    intensity_bytes = zlib.decompress(intensity_bytes)
+                if self.zlib_mz:
+                    mz_bytes = zlib.decompress(mz_bytes)
+                intensity = np.frombuffer(intensity_bytes, 
+                                          dtype=data.intensityPrecision)
+                mz = np.frombuffer(mz_bytes, 
+                                   dtype=data.mzPrecision)
+            else:
+                mz, intensity = data.getspectrum(idx)
             vector = binned_statistic(mz,
                                       intensity, 
                                       statistic = 'sum',

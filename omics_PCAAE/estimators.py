@@ -746,4 +746,64 @@ class UnitRegressor(BaseEstimator, RegressorMixin):
                 loss_trace.append(loss)
         return -np.log(np.mean(loss_trace))
 
+class LogZNormalizer(BaseEstimator, TransformerMixin):
+    """normalize the log z-scores of batches
+    
+    Parameters
+    ----------
 
+    
+    Attributes
+    ----------
+    means_ : ndarray of shape n_features
+        The means of the log of the features
+    
+    stds_ : ndarray of shape n_features
+        The standard deviations of the log of the features
+    """
+    
+    _parameter_constraints = {}
+    
+    def __sklearn_is_fitted__(self):
+        return hasattr(self, 'means_')
+    
+    @_fit_context(prefer_skip_nested_validation=True)
+    def fit(self, X, y=None, **kwargs):
+        """A reference implementation of a fitting function for a transformer.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape (n_samples, n_features)
+            The training input samples.
+
+        y : None
+            There is no need of a target in a transformer, yet the pipeline API
+            requires this parameter.
+
+        Returns
+        -------
+        self : object
+            Returns self.
+        """
+        X = validate_data(self, X)
+        X = np.log(X)
+        X[~np.isfinite(X)] = np.nan
+        self.means_ = np.nanmean(X, axis = 0)
+        self.stds_ = np.nanstd(X, axis = 0)
+        return self
+    
+    def transform(self, X, y, *args, **kwargs):
+        if not self.__sklearn_is_fitted__():
+            raise NotFittedError()
+        X, y = check_X_y(X, y)
+        X = np.log(X)
+        X[~np.isfinite(X)] = np.nan
+        for batch in set(y):
+            mask = y == batch
+            means = np.nanmean(X[mask, :], axis = 0)
+            stds = np.nanstd(X[mask, :], axis = 0)
+            vals = (X[mask,:] - means)/stds
+            X[mask,:] = (vals*self.stds_)+self.means_
+        X = np.exp(X)
+        X[~np.isfinite(X)] = 0
+        return X

@@ -137,3 +137,23 @@ class Loss:
         else:
             cov = 0
         return mse + cov
+
+class UnitRegressorModel(nn.Module):
+    def __init__(self, n_features, dropout = 0.1):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(n_features, 2**4),
+            nn.SiLU(),
+            nn.Dropout(p = dropout),            
+            nn.Linear(2**4, 2**4),
+            nn.SiLU(),
+            nn.Dropout(p = dropout),            
+            nn.Linear(2**4, 2**3),
+            nn.SiLU(),
+            nn.Dropout(p = dropout),            
+            nn.Linear(2**3, 1),
+            nn.Sigmoid()
+            )
+ 
+    def forward(self, x):
+        return self.layers(x)

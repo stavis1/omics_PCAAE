@@ -23,6 +23,7 @@ from copy import copy
 
 from tqdm import tqdm
 import torch
+import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from sortedcontainers import SortedList
@@ -39,7 +40,11 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.exceptions import NotFittedError, ConvergenceWarning
 from scipy.stats import spearmanr, pearsonr
 
-from omics_PCAAE._model_components import TrainingModel, TestingModel, InferenceModel, Loss
+from omics_PCAAE._model_components import (TrainingModel, 
+                                           TestingModel, 
+                                           InferenceModel, 
+                                           UnitRegressorModel,
+                                           Loss)
 from omics_PCAAE.processing import TorchDataset
 
 torch.use_deterministic_algorithms(True)
@@ -542,5 +547,200 @@ class SpyEM(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         preds = self.decision_function(X)
         return np.int32(preds >= self.threshold_)
 
+
+class UnitRegressor(BaseEstimator, RegressorMixin):
+    """A simple neural network regressor with outputs constrained to [0,1]
+    
+    Parameters
+    ----------
+    device : str, default='cpu'
+        The device used for all pytorch neural network operations, if a CUDA capable GPU
+        is available we suggest setting this to 'cuda'
+    
+    N_epochs : int, default=2
+        The number of training epochs per component. The total number of training
+        epochs is N_epochs * N_components
+    
+    learning_rate : float, default=0.002
+        This is the learning rate for the AdamW optimizer.
+    
+    batch_size : int, default=10
+        The size of each training batch.
+        
+    dropout : float, default=0.1
+        The per-parameter dropout probability during training.
+                
+    random_state : int or RandomState instance, default=0
+        The seed of the pseudo random number generator that selects the spy subset. 
+        Pass an int for reproducible output across multiple function calls.
+    
+    warm_start : bool, default=False
+        If true re-fitting the model will initialize weights with previously trained weights.
+    
+    Attributes
+    ----------
+    n_features_in_ : int
+        Number of features seen during :term:`fit`.
+    
+    feature_names_in_ : ndarray of shape (`n_features_in_`,)
+        Names of features seen during :term:`fit`. Defined only when `X`
+        has feature names that are all strings.                model.feature_weights = model.feature_weights.clamp(0,1)
+
+    
+    loss_trace_ : dict of shape {str : [float]}
+        Each training epoch saves the loss from each minibatch in a list with the epoch
+        name as the dictionary key.
+    """
+    
+    _parameter_constraints = {
+        'device': [str],
+        'N_epochs': [int],
+        'learning_rate': [float],
+        'batch_size': [int],
+        'dropout': [float],
+        'random_state': [int],
+        'warm_start': [bool]
+    }
+
+    def __init__(self,
+                 device = 'cpu',
+                 N_epochs = 2,
+                 learning_rate = 0.002,
+                 batch_size = 10,
+                 dropout = 0.1,
+                 random_state = 0,
+                 warm_start = False):
+        self.device = device
+        self.N_epochs = N_epochs
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.dropout = dropout
+        self.random_state = random_state
+        self.warm_start = warm_start
+        
+    def __sklearn_is_fitted__(self):
+        if not hasattr(self, 'model_'):
+            raise NotFittedError()
+
+    def _seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+    
+    def _set_random_state(self):
+        random_state = check_random_state(self.random_state).randint(0, 10000)
+        torch.manual_seed(random_state)
+        g = torch.Generator()
+        g.manual_seed(random_state)
+        return g
+    
+    def _get_dataloader(self, X, y = None, g = None, shuffle = True):
+        if type(X) != np.ndarray:
+            X = np.array(X)
+        X = TorchDataset(X, y)
+        if g is not None:
+            dataloader = torch.utils.data.DataLoader(X, 
+                                                     batch_size=self.batch_size, 
+                                                     shuffle=shuffle,
+                                                     worker_init_fn= self._seed_worker,
+                                                     generator=g)
+        else:
+            dataloader = torch.utils.data.DataLoader(X, 
+                                                     batch_size=self.batch_size, 
+                                                     shuffle=shuffle)
+        return dataloader
+    
+    def _get_model(self, N_features):
+        if not hasattr(self, 'model_') or self.model_ is None:
+            model = UnitRegressorModel(N_features, self.dropout)
+        else:
+            model = self.model_
+        model = model.to(self.device).to(torch.bfloat16)
+        return model
+    
+    def _get_loss(self):
+        return nn.MSELoss()
+    
+    def _train_model(self, X, y, *args, **kwargs):
+        g = self._set_random_state()
+        if not hasattr(self, 'loss_trace_'):
+            self.loss_trace_ = dict()
+        N_samples, N_features = X.shape
+        dataloader = self._get_dataloader(X, y, g)
+        self.model_ = self._get_model(N_features)
+        self.model_.train()
+        optimizer = optim.Adam(self.model_.parameters(), 
+                               lr=self.learning_rate)
+        scheduler = optim.lr_scheduler.LinearLR(optimizer, 
+                                                start_factor=0.01, 
+                                                end_factor=1.0, 
+                                                total_iters=N_samples*self.N_epochs)
+        loss_func = self._get_loss()
+        for epoch in range(self.N_epochs):
+            epoch_title = f'Epoch {epoch+1}/{self.N_epochs}'
+            if self.warm_start:
+                epoch_title += f', Training round {self.training_round_+1}'
+            self.loss_trace_[epoch_title] = []
+            progress_bar = tqdm(dataloader, desc=epoch_title)
+            for x, y in progress_bar:
+                x = x.to(self.device)
+                y = y.to(self.device)
+                
+                optimizer.zero_grad()
+                y_hat = self.model_(x)
+                loss = loss_func(y_hat.view(-1), 
+                                 y.view(-1))
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                self.loss_trace_[epoch_title].append(loss.item())
+                
+                progress_bar.set_postfix(loss=loss.item())
+
+    @_fit_context(prefer_skip_nested_validation=True)
+    def fit(self, X, y, *args, **kwargs):
+        X, y = check_X_y(X, y)
+        if not self.warm_start:
+            self.model_ = None
+        self._train_model(X, y)
+        return self
+    
+    def partial_fit(self, X, y, *args, **kwargs):
+        X, y = check_X_y(X, y)
+        self._train_model(X, y)
+        return self
+        
+    def predict(self, X, *args, **kwargs):
+        self.__sklearn_is_fitted__()
+        X = validate_data(self, X)
+        self.model_.eval()
+        self.model_.to(self.device).to(torch.bfloat16)
+        dataset = self._get_dataloader(X, shuffle = False)
+        with torch.no_grad():
+            y_hats = []
+            progress_bar = tqdm(dataset, desc='inference')
+            for x in progress_bar:
+                x = x.to(self.device)
+                y_hats.extend(self.model_(x).view(-1).to(torch.double).numpy(force = True))
+        return np.array(y_hats)
+
+    def score(self, X, y, *args, **kwargs):
+        self.__sklearn_is_fitted__()
+        X, y = check_X_y(X, y)
+        g = self._set_random_state()
+        N_samples, N_features = X.shape
+        dataloader = self._get_dataloader(X, y, g)
+        with torch.no_grad():
+            self.model_.eval()
+            loss_trace = []
+            progress_bar = tqdm(dataloader, desc='evaluation')
+            for x, y in progress_bar:
+                x = x.to(self.device)
+                y = y.to(self.device)
+                y_hat = self.model_(x)
+                loss = self._loss_func(y_hat.view(-1), 
+                                       y.view(-1),
+                                       self.model_.feature_weights)
+                loss_trace.append(loss)
+        return -np.log(np.mean(loss_trace))
 
 

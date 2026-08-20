@@ -368,7 +368,7 @@ class SparseDiskDataset:
 
             for parquet in parquets:
                 data = pd.read_parquet(parquet, engine='pyarrow')
-                if not 'z' in data.columns:
+                if not 'z' in data.columns and 'z' in self.metadata:
                     self.metadata.remove('z')
                     col_list.remove('z')
                 missing_cols = list(set(col_list).difference(data.columns))
